@@ -1,11 +1,14 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
+import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.imageio.ImageIO;
 import javax.imageio.stream.ImageInputStream;
 
@@ -13,10 +16,12 @@ import javax.imageio.stream.ImageInputStream;
 public class WebServer {
     private LostAndFoundSystem system = new LostAndFoundSystem();
     private Map<String, Student> accounts = new HashMap<>();
-    private final Map<String, Session> sessions = new HashMap<>();
+    private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private Map<Item, String> photos = new HashMap<>();
     private ArrayList<OwnershipRequest> requests = new ArrayList<>();
+    private final Set<String> verifiedAccounts = Collections.synchronizedSet(new HashSet<>());
     private final String domain = System.getenv().getOrDefault("COLLEGE_EMAIL_DOMAIN", "muj.manipal.edu").toLowerCase(Locale.ROOT);
+    private final String adminPasscode = System.getenv().getOrDefault("ADMIN_PASSCODE", "admin123");
     private final Path directory = Path.of("").toAbsolutePath();
     private final Path dataFile = Path.of(System.getenv().getOrDefault("LF_DATA_FILE", "data/lost-found.bin"));
 
@@ -53,7 +58,7 @@ public class WebServer {
         catch (AtomicMoveNotSupportedException e) { Files.move(temporary, dataFile, StandardCopyOption.REPLACE_EXISTING); }
     }
 
-    private static final int MAX_BODY = 2_000_000;
+    private static final int MAX_BODY = 15_000_000;
 
     public static void main(String[] args) throws IOException {
         String envPort = System.getenv("PORT");
@@ -110,7 +115,28 @@ public class WebServer {
     }
 
     private Object route(HttpExchange x, String path, String method, Map<String, String> p) throws Exception {
-        if (path.equals("/api/config") && method.equals("GET")) return Map.of("domain", domain);
+        if (path.equals("/api/config") && method.equals("GET")) return Map.of("domain", domain, "adminEnabled", true, "aiEnabled", System.getenv("GEMINI_API_KEY") != null);
+        if (path.equals("/api/verify-ms") && method.equals("POST")) {
+            String email = field(p, "email", 160).toLowerCase(Locale.ROOT);
+            require(email.endsWith("@" + domain), 400, "Please use your official @" + domain + " Microsoft account.");
+            verifiedAccounts.add(email);
+            return Map.of("verified", true, "email", email);
+        }
+        if (path.equals("/api/admin/login") && method.equals("POST")) {
+            String email = field(p, "email", 160).toLowerCase(Locale.ROOT);
+            String passcode = field(p, "passcode", 100);
+            require(passcode.equals(adminPasscode), 401, "Invalid admin passcode.");
+            require(email.contains("@") && email.endsWith("@" + domain), 400, "Use your @" + domain + " faculty/staff email.");
+            Student admin = accounts.computeIfAbsent("ADMIN001", k -> new Student("Faculty / Admin", "ADMIN001", email));
+            String oldToken = token(x);
+            if (oldToken != null) sessions.remove(oldToken);
+            String token = UUID.randomUUID().toString();
+            sessions.put(token, new Session(admin, true));
+            x.getResponseHeaders().set("Set-Cookie", "LFSESSION=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
+            Map<String, Object> data = new LinkedHashMap<>(studentData(admin));
+            data.put("isAdmin", true);
+            return data;
+        }
         if (path.equals("/api/login") && method.equals("POST")) {
             String name = field(p, "name", 80), id = field(p, "studentId", 30);
             String email = field(p, "email", 160).toLowerCase(Locale.ROOT);
@@ -131,8 +157,13 @@ public class WebServer {
             x.getResponseHeaders().set("Set-Cookie", "LFSESSION=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
             return studentData(student);
         }
+        Session activeSession = sessions.get(token(x));
         Student user = signedIn(x);
-        if (path.equals("/api/me") && method.equals("GET")) return studentData(user);
+        if (path.equals("/api/me") && method.equals("GET")) {
+            Map<String, Object> data = new LinkedHashMap<>(studentData(user));
+            data.put("isAdmin", activeSession != null && activeSession.isAdmin);
+            return data;
+        }
         if (path.equals("/api/logout") && method.equals("POST")) {
             sessions.remove(token(x));
             x.getResponseHeaders().set("Set-Cookie", "LFSESSION=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
@@ -233,6 +264,66 @@ public class WebServer {
             f.setClaimed(true);
             return Map.of("ok", true);
         }
+        if (path.equals("/api/admin/overview") && method.equals("GET")) {
+            Session s = session(x);
+            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            ArrayList<Object> allLost = new ArrayList<>();
+            for (LostItem l : system.getAllLostItems()) {
+                Map<String, Object> row = lostData(l);
+                row.put("reporterName", l.getReportedBy().getName());
+                row.put("reporterEmail", l.getReportedBy().getEmail());
+                row.put("reporterId", l.getReportedBy().getStudentId());
+                allLost.add(row);
+            }
+            ArrayList<Object> allFound = new ArrayList<>();
+            for (FoundItem f : system.getAllFoundItems()) {
+                Map<String, Object> row = foundData(f);
+                row.put("reporterName", f.getReportedBy().getName());
+                row.put("reporterEmail", f.getReportedBy().getEmail());
+                row.put("reporterId", f.getReportedBy().getStudentId());
+                row.put("phone", f.getContactNumber());
+                allFound.add(row);
+            }
+            ArrayList<Object> allRequests = new ArrayList<>();
+            for (OwnershipRequest r : requests) {
+                allRequests.add(Map.of(
+                    "id", r.id,
+                    "proof", r.proof,
+                    "status", r.status,
+                    "itemName", r.found.getName(),
+                    "foundId", r.found.getId(),
+                    "finderName", r.found.getReportedBy().getName(),
+                    "finderEmail", r.found.getReportedBy().getEmail(),
+                    "claimantName", r.lost.getReportedBy().getName(),
+                    "claimantEmail", r.lost.getReportedBy().getEmail()
+                ));
+            }
+            Map<String, Object> stats = Map.of(
+                "totalLost", allLost.size(),
+                "totalFound", allFound.size(),
+                "totalReturned", allFound.stream().filter(f -> Boolean.TRUE.equals(((Map<?,?>)f).get("claimed"))).count(),
+                "totalClaims", allRequests.size(),
+                "totalAccounts", accounts.size()
+            );
+            return Map.of("stats", stats, "lost", allLost, "found", allFound, "requests", allRequests);
+        }
+        if (path.equals("/api/admin/delete") && method.equals("POST")) {
+            Session s = session(x);
+            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            String type = field(p, "type", 10);
+            int id = number(p, "id");
+            if ("lost".equals(type)) system.removeLostItem(id);
+            else if ("found".equals(type)) system.removeFoundItem(id);
+            return Map.of("ok", true);
+        }
+        if (path.equals("/api/admin/resolve") && method.equals("POST")) {
+            Session s = session(x);
+            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            FoundItem f = system.getFoundItem(number(p, "id"));
+            require(f != null, 404, "Found item not found.");
+            f.setClaimed(true);
+            return Map.of("ok", true);
+        }
         throw new Problem(404, "Endpoint not found.");
     }
 
@@ -257,32 +348,110 @@ public class WebServer {
         Map<String, Object> row = itemData(f);
         row.put("id", f.getId()); row.put("date", f.getDateFound()); row.put("claimed", f.isClaimed()); return row;
     }
-    private Map<String, String> studentData(Student s) { return Map.of("name", s.getName(), "studentId", s.getStudentId(), "email", s.getEmail()); }
+    private Map<String, Object> studentData(Student s) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("name", s.getName());
+        row.put("studentId", s.getStudentId());
+        row.put("email", s.getEmail());
+        row.put("isVerifiedMs", verifiedAccounts.contains(s.getEmail()));
+        return row;
+    }
     private String token(HttpExchange x) {
         String cookies = x.getRequestHeaders().getFirst("Cookie");
         if (cookies != null) for (String c : cookies.split(";")) if (c.trim().startsWith("LFSESSION=")) return c.trim().substring(10);
         return null;
     }
-    private Student signedIn(HttpExchange x) {
+    private Session session(HttpExchange x) {
         Session s = sessions.get(token(x));
         require(s != null && s.expires.isAfter(Instant.now()), 401, "Please sign in again.");
-        return s.student;
+        return s;
+    }
+    private Student signedIn(HttpExchange x) {
+        return session(x).student;
     }
     private static void validatePhoto(String value, boolean required) throws IOException {
         if (value.isEmpty()) { require(!required, 400, "A photo is required for a found item."); return; }
         require(value.startsWith("data:image/jpeg;base64,") || value.startsWith("data:image/png;base64,"), 400, "Choose a JPG or PNG photo.");
         byte[] data = Base64.getDecoder().decode(value.substring(value.indexOf(',') + 1));
-        require(data.length <= 1_000_000, 413, "Choose a photo smaller than 1 MB.");
+        require(data.length <= 10_000_000, 413, "Choose a photo smaller than 10 MB.");
         try (ImageInputStream input = ImageIO.createImageInputStream(new ByteArrayInputStream(data))) {
             var readers = ImageIO.getImageReaders(input);
             require(readers.hasNext(), 400, "This file is not a readable photo.");
             var reader = readers.next();
             try {
                 reader.setInput(input);
-                require((long) reader.getWidth(0) * reader.getHeight(0) <= 20_000_000, 400, "Choose a smaller photo (up to 20 megapixels).");
+                require((long) reader.getWidth(0) * reader.getHeight(0) <= 25_000_000, 400, "Choose a smaller photo (up to 25 megapixels).");
                 require(reader.read(0) != null, 400, "This photo could not be read.");
             } finally { reader.dispose(); }
         }
+        verifyImageWithAI(value, data);
+    }
+    private static void verifyImageWithAI(String base64Value, byte[] rawBytes) {
+        String apiKey = System.getenv("GEMINI_API_KEY");
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            try {
+                String mimeType = base64Value.startsWith("data:image/png") ? "image/png" : "image/jpeg";
+                String base64Data = base64Value.substring(base64Value.indexOf(',') + 1);
+                String promptText = "Analyze this image. Is this image showing an actual, physical everyday lost-or-found item (e.g. wallet, phone, laptop, charger, keys, ID card, bottle, bag, glasses, notebook, earbuds, clothing, umbrella, jewelry, watch, or document)? "
+                    + "Reject if it is: completely blank or black screen, a screenshot of a chat/meme/code, an empty floor or blank wall with no item, or completely unrelated. "
+                    + "Respond ONLY in this exact JSON format: {\\\"valid\\\": true, \\\"reason\\\": \\\"detected object\\\"} or {\\\"valid\\\": false, \\\"reason\\\": \\\"brief reason\\\"}";
+
+                String jsonPayload = "{\"contents\":[{\"parts\":["
+                    + "{\"text\":\"" + promptText.replace("\"", "\\\"") + "\"},"
+                    + "{\"inline_data\":{\"mime_type\":\"" + mimeType + "\",\"data\":\"" + base64Data + "\"}}"
+                    + "]}]}";
+
+                HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(6)).build();
+                HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + apiKey.trim()))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+                    .timeout(Duration.ofSeconds(10))
+                    .build();
+
+                HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) {
+                    String body = resp.body().toLowerCase(Locale.ROOT);
+                    if (body.contains("\"valid\": false") || body.contains("\"valid\":false")) {
+                        throw new Problem(400, "AI Verification: Please upload a clear photo of an actual physical object. Random or blank images are not allowed.");
+                    }
+                    return;
+                }
+            } catch (Problem p) {
+                throw p;
+            } catch (Exception e) {
+                System.out.println("Gemini Vision check notice: " + e.getMessage());
+            }
+        }
+
+        try {
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(rawBytes));
+            if (img != null) {
+                int w = img.getWidth(), h = img.getHeight();
+                require(w >= 60 && h >= 60, 400, "AI Verification: Photo is too small. Please upload a clear photo of the object.");
+                long sum = 0, sumSq = 0;
+                int count = 0;
+                for (int x = 0; x < w; x += Math.max(1, w / 12)) {
+                    for (int y = 0; y < h; y += Math.max(1, h / 12)) {
+                        int rgb = img.getRGB(x, y);
+                        int r = (rgb >> 16) & 0xff, g = (rgb >> 8) & 0xff, b = rgb & 0xff;
+                        int bright = (r + g + b) / 3;
+                        sum += bright;
+                        sumSq += (long) bright * bright;
+                        count++;
+                    }
+                }
+                if (count > 0) {
+                    double mean = (double) sum / count;
+                    double variance = ((double) sumSq / count) - (mean * mean);
+                    if (variance < 15.0) {
+                        throw new Problem(400, "AI Verification: The photo appears blank or uniform. Please take a clear, well-lit photo of the actual object.");
+                    }
+                }
+            }
+        } catch (Problem p) {
+            throw p;
+        } catch (Exception ignored) {}
     }
     private static int number(Map<String, String> p, String key) { return Integer.parseInt(p.getOrDefault(key, "0")); }
     private static String field(Map<String, String> p, String key, int max) {
@@ -299,7 +468,13 @@ public class WebServer {
     }
     private static void require(boolean condition, int code, String message) { if (!condition) throw new Problem(code, message); }
     private static class Problem extends RuntimeException { final int status; Problem(int status, String text) { super(text); this.status = status; } }
-    private static class Session { final Student student; final Instant expires = Instant.now().plusSeconds(28800); Session(Student s) { student = s; } }
+    private static class Session {
+        final Student student;
+        final boolean isAdmin;
+        final Instant expires = Instant.now().plusSeconds(28800);
+        Session(Student s) { this(s, false); }
+        Session(Student s, boolean isAdmin) { this.student = s; this.isAdmin = isAdmin; }
+    }
     private static class OwnershipRequest implements Serializable {
         private static final long serialVersionUID = 1L;
         final int id; final LostItem lost; final FoundItem found; final String proof; String status = "pending";

@@ -34,11 +34,33 @@ public class LostAndFoundSystem implements java.io.Serializable {
         return mine;
     }
 
+    // Method Overloading (Compile-time Polymorphism):
+    // 1. Default threshold (50%)
     public ArrayList<FoundItem> getMatchingItems(LostItem lost) {
+        return getMatchingItems(lost, 50);
+    }
+
+    // 2. Overloaded method with custom minimum score parameter
+    public ArrayList<FoundItem> getMatchingItems(LostItem lost, int minScore) {
         ArrayList<FoundItem> matches = new ArrayList<>();
         for (FoundItem found : foundItems)
-            if (!found.isClaimed() && calculateMatchScore(lost, found) >= 50) matches.add(found);
+            if (!found.isClaimed() && calculateMatchScore(lost, found) >= minScore) matches.add(found);
         return matches;
+    }
+
+    public ArrayList<LostItem> getAllLostItems() { return lostItems; }
+    public ArrayList<FoundItem> getAllFoundItems() { return foundItems; }
+
+    public boolean removeLostItem(int id) {
+        if (id > 0 && id <= lostItems.size()) {
+            lostItems.remove(id - 1);
+            return true;
+        }
+        return false;
+    }
+
+    public boolean removeFoundItem(int id) {
+        return foundItems.removeIf(f -> f.getId() == id);
     }
 
     // The next ID for a found item (1, 2, 3, ...).

@@ -11,6 +11,10 @@ public class Item implements java.io.Serializable {
         timeFrom = from;
         timeTo = to;
     }
+    // Method Overloading: set a single exact time instead of a range
+    public void setTimeRange(String exactTime) {
+        setTimeRange(exactTime, exactTime);
+    }
 
     private String name;
     private String category;
