@@ -127,41 +127,69 @@ public class WebServer {
             String passcode = field(p, "passcode", 100);
             require(passcode.equals(adminPasscode), 401, "Invalid admin passcode.");
             require(email.contains("@") && email.endsWith("@" + domain), 400, "Use your @" + domain + " faculty/staff email.");
-            Student admin = accounts.computeIfAbsent("ADMIN001", k -> new Student("Faculty / Admin", "ADMIN001", email));
+            Student admin = accounts.computeIfAbsent("ADMIN001", k -> new Student("Campus Administrator", "ADMIN001", email));
             String oldToken = token(x);
             if (oldToken != null) sessions.remove(oldToken);
             String token = UUID.randomUUID().toString();
-            sessions.put(token, new Session(admin, true));
+            sessions.put(token, new Session(admin, true, true));
             x.getResponseHeaders().set("Set-Cookie", "LFSESSION=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
             Map<String, Object> data = new LinkedHashMap<>(studentData(admin));
             data.put("isAdmin", true);
+            data.put("isFaculty", true);
+            return data;
+        }
+        if (path.equals("/api/faculty/login") && method.equals("POST")) {
+            String email = field(p, "email", 160).toLowerCase(Locale.ROOT);
+            String facultyId = field(p, "facultyId", 40).toUpperCase(Locale.ROOT);
+            String name = field(p, "name", 80);
+            require(email.endsWith("@" + domain), 400, "Use your official @" + domain + " faculty email.");
+            require(facultyId.matches("[A-Za-z0-9\\-_]{3,20}"), 400, "Enter a valid Faculty / Staff ID (e.g. FAC101).");
+            Student faculty = accounts.computeIfAbsent(facultyId, k -> new Student(name.isEmpty() ? "Faculty Member" : name, facultyId, email));
+            String oldToken = token(x);
+            if (oldToken != null) sessions.remove(oldToken);
+            String token = UUID.randomUUID().toString();
+            sessions.put(token, new Session(faculty, false, true));
+            x.getResponseHeaders().set("Set-Cookie", "LFSESSION=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
+            Map<String, Object> data = new LinkedHashMap<>(studentData(faculty));
+            data.put("isAdmin", false);
+            data.put("isFaculty", true);
             return data;
         }
         if (path.equals("/api/login") && method.equals("POST")) {
-            String name = field(p, "name", 80), id = field(p, "studentId", 30);
+            String name = field(p, "name", 80), id = field(p, "studentId", 30).trim();
             String email = field(p, "email", 160).toLowerCase(Locale.ROOT);
-            require(id.matches("[0-9]{10}"), 400, "Enter your 10-digit registration number.");
+            String role = p.getOrDefault("role", "student");
+            boolean isFacultyRole = "faculty".equalsIgnoreCase(role) || id.toUpperCase(Locale.ROOT).startsWith("FAC") || id.toUpperCase(Locale.ROOT).startsWith("STAFF");
+            if (isFacultyRole) {
+                require(id.matches("[A-Za-z0-9\\-_]{3,20}"), 400, "Enter a valid Faculty / Staff ID (e.g. FAC101 or 10 digits).");
+            } else {
+                require(id.matches("[0-9]{10}"), 400, "Enter your 10-digit registration number.");
+            }
             require(email.matches("[a-z0-9]+(?:[._%+\\-][a-z0-9]+)*@" + java.util.regex.Pattern.quote(domain)), 400, "Use a valid @" + domain + " email.");
             Student student = accounts.get(id);
             if (student == null) {
-                for (Student existing : accounts.values()) require(!existing.getEmail().equals(email), 409, "This email is already associated with a registration number.");
+                for (Student existing : accounts.values()) require(!existing.getEmail().equals(email), 409, "This email is already associated with an ID.");
                 student = new Student(name, id, email);
                 accounts.put(id, student);
             } else {
-                require(student.getEmail().equals(email), 409, "Use the email previously entered for this registration number.");
+                require(student.getEmail().equals(email), 409, "Use the email previously entered for this ID.");
             }
             String oldToken = token(x);
             if (oldToken != null) sessions.remove(oldToken);
             String token = UUID.randomUUID().toString();
-            sessions.put(token, new Session(student));
+            sessions.put(token, new Session(student, false, isFacultyRole));
             x.getResponseHeaders().set("Set-Cookie", "LFSESSION=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800");
-            return studentData(student);
+            Map<String, Object> data = new LinkedHashMap<>(studentData(student));
+            data.put("isAdmin", false);
+            data.put("isFaculty", isFacultyRole);
+            return data;
         }
         Session activeSession = sessions.get(token(x));
         Student user = signedIn(x);
         if (path.equals("/api/me") && method.equals("GET")) {
             Map<String, Object> data = new LinkedHashMap<>(studentData(user));
             data.put("isAdmin", activeSession != null && activeSession.isAdmin);
+            data.put("isFaculty", activeSession != null && (activeSession.isAdmin || activeSession.isFaculty));
             return data;
         }
         if (path.equals("/api/logout") && method.equals("POST")) {
@@ -264,9 +292,9 @@ public class WebServer {
             f.setClaimed(true);
             return Map.of("ok", true);
         }
-        if (path.equals("/api/admin/overview") && method.equals("GET")) {
+        if ((path.equals("/api/admin/overview") || path.equals("/api/faculty/overview")) && method.equals("GET")) {
             Session s = session(x);
-            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            require(s.isAdmin || s.isFaculty, 403, "Faculty & Admin portal access only.");
             ArrayList<Object> allLost = new ArrayList<>();
             for (LostItem l : system.getAllLostItems()) {
                 Map<String, Object> row = lostData(l);
@@ -309,16 +337,16 @@ public class WebServer {
         }
         if (path.equals("/api/admin/delete") && method.equals("POST")) {
             Session s = session(x);
-            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            require(s.isAdmin, 403, "Central Administrator access required to delete reports.");
             String type = field(p, "type", 10);
             int id = number(p, "id");
             if ("lost".equals(type)) system.removeLostItem(id);
             else if ("found".equals(type)) system.removeFoundItem(id);
             return Map.of("ok", true);
         }
-        if (path.equals("/api/admin/resolve") && method.equals("POST")) {
+        if ((path.equals("/api/admin/resolve") || path.equals("/api/faculty/resolve")) && method.equals("POST")) {
             Session s = session(x);
-            require(s.isAdmin, 403, "Faculty & Admin portal access only.");
+            require(s.isAdmin || s.isFaculty, 403, "Faculty & Admin portal access only.");
             FoundItem f = system.getFoundItem(number(p, "id"));
             require(f != null, 404, "Found item not found.");
             f.setClaimed(true);
@@ -471,9 +499,11 @@ public class WebServer {
     private static class Session {
         final Student student;
         final boolean isAdmin;
+        final boolean isFaculty;
         final Instant expires = Instant.now().plusSeconds(28800);
-        Session(Student s) { this(s, false); }
-        Session(Student s, boolean isAdmin) { this.student = s; this.isAdmin = isAdmin; }
+        Session(Student s) { this(s, false, false); }
+        Session(Student s, boolean isAdmin) { this(s, isAdmin, isAdmin); }
+        Session(Student s, boolean isAdmin, boolean isFaculty) { this.student = s; this.isAdmin = isAdmin; this.isFaculty = isFaculty; }
     }
     private static class OwnershipRequest implements Serializable {
         private static final long serialVersionUID = 1L;
